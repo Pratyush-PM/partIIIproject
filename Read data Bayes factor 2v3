@@ -1,0 +1,771 @@
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.optimize import curve_fit
+import torch
+from torch.optim import Adam
+import scipy.stats as stat
+from scipy.stats import multivariate_normal
+import sbi
+import lsbi
+from lsbi.network import BinaryClassifierLPop, BinaryClassifier
+import math
+import sys
+import pickle
+from datetime import datetime
+import IPython
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import time
+from IPython.display import clear_output
+from mpl_toolkits.mplot3d import Axes3D
+from ipywidgets import interactive, HBox, VBox
+import plotly.graph_objects as go
+from ipywidgets import interact, FloatSlider
+from torch import nn
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import ExponentialLR
+
+# Define events as number of events total, this is the realy experimental data, not events per bin
+
+def load_and_process_data(data_path):
+    De = pd.read_csv(data_path, usecols=["Mass [GeV]", "Mass [GeV] LOW", "Mass [GeV] HIGH", "Events/10 GeV"])
+    De_mass = De["Mass [GeV]"].values
+    De_events_scaled = (De["Mass [GeV] HIGH"].values - De["Mass [GeV] LOW"].values) * De["Events/10 GeV"].values
+    De_events_scaled_min = min([i for i in De_events_scaled if i != 0])
+    De_event = De_events_scaled / De_events_scaled_min
+    yerr = np.sqrt(De_event)
+    return De_mass, De_event, yerr
+
+# Define optimiser classes
+
+class optim_p2_poisson:
+    def __init__(self, data_path):
+        self.gamma = 2.4952
+        self.mz = 91.1876
+        self.De_mass, self.De_event, self.yerr = load_and_process_data(data_path)
+        self.x = self.De_mass / 13000
+        self.x_tensor = torch.tensor(self.x, dtype=torch.float32)
+        self.y_tensor = torch.tensor(self.De_event, dtype=torch.float32)
+        self.y_err_tensor = torch.tensor(self.yerr, dtype=torch.float32)
+        self.c_e_ft = 1
+
+    def create_priors(self):
+        return np.random.uniform(low=[1.7 * 10**5, 1, -13.2, -4.75, -0.95], high=[1.9 * 10**5, 5, -11.5, -4, -0.45])
+
+    def curve_torch_2(self, x, a_ft, b_ft, p0_ft, p1_ft, p2_ft):
+        BW2 = self.gamma / ((x * 13000 - self.mz) ** 2 + (self.gamma ** 2) / 4)
+        log_x = torch.log(x)
+        curve_ft = BW2 * ((1 - x ** self.c_e_ft) ** b_ft) * x ** (p0_ft + p1_ft * log_x + p2_ft * log_x ** 2)
+        norm_ft = a_ft / curve_ft.sum()
+        return norm_ft * curve_ft
+
+    def loglike(self, y_pred, y, y_err_tensor):
+        # y = y.round()
+        return nn.PoissonNLLLoss(log_input=False, full=True)(y_pred, y)
+
+    def threshold(self):
+        return 40
+
+    def adjust_theta_2(self):
+        priors = self.create_priors()
+        theta_opt = []
+        for i in range(len(priors)):
+            theta_opt.append(torch.tensor(priors[i], dtype=torch.float32, requires_grad=True))
+        theta_opt = torch.tensor(theta_opt, dtype=torch.float32, requires_grad=True)
+        y_pred_2 = self.curve_torch_2(self.x_tensor, *theta_opt)
+
+        if not all(y_val > 1 for y_val in y_pred_2[:80]) and all(y_val > 10**2 for y_val in y_pred_2[:1]) and all(y_pred_2[0] > elem for elem in y_pred_2[1:]):
+            while not all(y_val > 1 for y_val in y_pred_2[:80]) and all(y_val > 10**2 for y_val in y_pred_2[:1]) and all(y_pred_2[0] > elem for elem in y_pred_2[1:]):
+                priors = self.create_priors()
+                theta_opt = []
+                for i in range(len(priors)):
+                    theta_opt.append(torch.tensor(priors[i], dtype=torch.float32, requires_grad=True))
+                theta_opt = torch.tensor(theta_opt, dtype=torch.float32, requires_grad=True)
+                y_pred_2 = self.curve_torch_2(self.x_tensor, *theta_opt)
+                loss = self.loglike(y_pred_2, self.y_tensor, self.y_err_tensor)
+        else:
+            loss = self.loglike(y_pred_2, self.y_tensor, self.y_err_tensor)
+            theta_opt = theta_opt
+            y_pred_2 = y_pred_2
+        return loss, theta_opt, y_pred_2
+
+    def run(self):
+        success = False
+
+        while not success:
+
+            initial_loss, theta_opt, y_pred_2 = self.adjust_theta_2()
+            theta_initial = theta_opt.clone().detach()
+            self.theta_initial = theta_initial
+
+            lr = 0.01
+            optimizer = Adam([theta_opt], lr)
+            loss = initial_loss
+            losses = []
+            max_N = 10000
+            loss_crit = 1.5
+            loss_filter = 4.4
+            N_iter_filter = 1000
+            N_iter = 0
+
+            while N_iter < max_N:
+                # if N_iter == 0:
+                #     print(f"Initial Loss = {loss}")
+                optimizer.zero_grad()
+                y_pred_2 = self.curve_torch_2(self.x_tensor, *theta_opt)
+                loss = self.loglike(y_pred_2, self.y_tensor, self.y_err_tensor)
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.detach().numpy())
+                N_iter += 1
+                # if loss < loss_crit:
+                #     success = True
+                #     break
+                # if N_iter % 250 == 0:
+                    # print(f"N_iter = {N_iter}")
+                    # print(f"Loss = {loss}")
+                if N_iter == N_iter_filter and loss > loss_filter:
+                    print(f"Final loss before filter = {losses[-1]}")
+                    # print("Loss too high. Starting again.")
+                    break
+                # if N_iter == N_iter_filter and loss < loss_filter:
+                    # print(f"Loss at filter = {losses[-1]}")
+            # else:
+                # print("Max number of iterations reach, no optimised value found. Starting again.")
+
+            if N_iter == max_N:
+                success = True
+
+        if success == True:
+
+            theta_final = []
+
+            for i in range(len(theta_opt)):
+                theta_final.append(theta_opt[i])
+            
+            self.theta_final = torch.tensor(theta_final, dtype=torch.float32)
+            self.max_N = max_N
+            self.loss_filter = loss_filter
+            self.N_iter_filter = N_iter_filter
+            self.learning_rate = lr
+            self.losses = np.array(losses)
+        
+            print(f"Final theta = {self.theta_final}, Final loss = {losses[-1]}, Number of iterations = {N_iter}")
+            
+            # # Save results if good
+
+            # timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            # filename_theta_initial = f"Theta_3_initial_{timestamp}.txt"
+            # filename_theta_final = f"Theta_3_final_{timestamp}.txt"
+
+            # with open(filename_theta_initial, 'w') as f:
+            #     f.write(str(self.theta_final.tolist()))
+            # with open(filename_theta_final, 'w') as f:
+            #     f.write(str(self.theta_final.tolist()))
+
+            # #Save figures
+            # plt.errorbar(De_mass, De_event, yerr=yerr, fmt='.', color='black', ecolor='red')
+            # y_pred_3_plot = curve_torch_3(x_tensor, *theta_final).detach().numpy()
+            # plt.plot(De_mass, y_pred_3_plot)
+            # plt.yscale("log")
+            # plt.xscale("log")
+            # plt.xlabel("Mass [GeV]")
+            # plt.ylabel("Events/10 GeV")
+            # plt.xlim(200, 4000)
+            # plt.ylim(top=10**5)
+            # plt.xticks([200, 300, 400, 1000, 2000, 3000, 4000])
+
+            # filename_fig = f"Fig_3_{timestamp}.pdf"
+            # plt.savefig(filename_fig)
+            # plt.show()
+
+            # f_loss,a_loss = plt.subplots()
+            # a_loss.plot(losses)
+            # a_loss.set_yscale("log")
+            # a_loss.set_ylabel("Loss")
+            # a_loss.set_xlabel("Iteration")
+
+            # filename_figloss = f"Fig_3_loss_{timestamp}.pdf"
+            # f_loss.savefig(filename_figloss, bbox_inches="tight")
+
+
+
+
+            # # Plot results
+
+            # plt.errorbar(self.De_mass, self.De_event, yerr=self.yerr, fmt='.', color='black', ecolor='red')
+            # y_pred_2_plot = self.curve_torch_2(self.x_tensor, *theta_final).detach().numpy()
+            # plt.plot(self.De_mass, y_pred_2_plot)
+            # plt.yscale("log")
+            # plt.xscale("log")
+            # plt.xlabel("Mass [GeV]")
+            # plt.ylabel("Events/10 GeV")
+            # plt.xlim(200, 5000)
+            # plt.ylim(bottom=10**-2, top=10**5)
+            # plt.xticks([200, 300, 400, 1000, 2000, 3000, 4000, 5000])
+            # plt.title("True data")
+            # plt.show()
+
+            # # plt.errorbar(De_mass, De_event.round(), yerr=yerr, fmt='.', color='black', ecolor='red')
+            # # y_pred_2_plot = self.curve_torch_2(self.x_tensor, *theta_final).detach().numpy()
+            # # plt.plot(De_mass, y_pred_2_plot)
+            # # plt.yscale("log")
+            # # plt.xscale("log")
+            # # plt.xlabel("Mass [GeV]")
+            # # plt.ylabel("Events/10 GeV")
+            # # plt.xlim(200, 4000)
+            # # plt.ylim(top=10**5)
+            # # plt.xticks([200, 300, 400, 1000, 2000, 3000, 4000])
+            # # plt.title("Rounded data")
+
+            # f_loss,a_loss = plt.subplots()
+            # a_loss.plot(losses)
+            # # a_loss.set_yscale("log")
+            # a_loss.set_ylabel("Loss")
+            # a_loss.set_xlabel("Iteration")
+            # # a_loss.set_xlim(N_iter-1000, N_iter)
+            # # a_loss.set_ylim(0.55, 0.6)
+
+class optim_p3_poisson:
+    def __init__(self, data_path):
+        self.gamma = 2.4952
+        self.mz = 91.1876
+        self.De_mass, self.De_event, self.yerr = load_and_process_data(data_path)
+        self.x = self.De_mass / 13000
+        self.x_tensor = torch.tensor(self.x, dtype=torch.float32)
+        self.y_tensor = torch.tensor(self.De_event, dtype=torch.float32)
+        self.y_err_tensor = torch.tensor(self.yerr, dtype=torch.float32)
+        self.c_e_ft = 1
+
+    def create_priors(self):
+        return np.random.uniform(low=[1.7 * 10**5, 1, -13.5, -5.2, -0.95, -0.1], high=[1.9 * 10**5, 5, -11, -3.5, -0.45, -0.04])
+
+    def curve_torch_3(self, x, a_ft, b_ft, p0_ft, p1_ft, p2_ft, p3_ft):
+        BW2 = self.gamma / ((x * 13000 - self.mz) ** 2 + (self.gamma ** 2) / 4)
+        log_x = torch.log(x)
+        curve_ft = BW2 * ((1 - x ** self.c_e_ft) ** b_ft) * x ** (p0_ft + p1_ft * log_x + p2_ft * log_x ** 2 + p3_ft * log_x ** 3)
+        norm_ft = a_ft / curve_ft.sum()
+        # print(f"Norm = {norm_ft}")
+        # print(f"Base function = {((1 - x ** self.c_e_ft) ** b_ft)}")
+        # print(f"X function = {x ** (p0_ft + p1_ft * log_x + p2_ft * log_x ** 2 + p3_ft * log_x ** 3)}")
+        # print(f"BW2 = {BW2}")
+        return norm_ft * curve_ft
+
+    def loglike(self, y_pred, y, y_err_tensor):
+        # y = y.round()
+        return nn.PoissonNLLLoss(log_input=False, full=True)(y_pred, y)
+
+    def adjust_theta_3(self):
+        priors = self.create_priors()
+        theta_opt = []
+        for i in range(len(priors)):
+            theta_opt.append(torch.tensor(priors[i], dtype=torch.float32, requires_grad=True))
+        theta_opt = torch.tensor(theta_opt, dtype=torch.float32, requires_grad=True)
+        y_pred_3 = self.curve_torch_3(self.x_tensor, *theta_opt)
+        
+        if not all(y_val > 1 for y_val in y_pred_3[:80]) and all(y_val > 10**2 for y_val in y_pred_3[:1]) and all(y_pred_3[0] > elem for elem in y_pred_3[1:]):
+            while not all(y_val > 1 for y_val in y_pred_3[:80]) and all(y_val > 10**2 for y_val in y_pred_3[:1]) and all(y_pred_3[0] > elem for elem in y_pred_3[1:]):
+                priors = self.create_priors()
+                theta_opt = []
+                for i in range(len(priors)):
+                    theta_opt.append(torch.tensor(priors[i], dtype=torch.float32, requires_grad=True))
+                theta_opt = torch.tensor(theta_opt, dtype=torch.float32, requires_grad=True)
+                y_pred_3 = self.curve_torch_3(self.x_tensor, *theta_opt)
+                loss = self.loglike(y_pred_3, self.y_tensor, self.y_err_tensor)
+        else:
+            loss = self.loglike(y_pred_3, self.y_tensor, self.y_err_tensor)
+            theta_opt = theta_opt
+            y_pred_3 = y_pred_3
+        return loss, theta_opt, y_pred_3
+
+    def run(self):
+        
+        success = False
+
+        while not success:
+            initial_loss, theta_opt, y_pred_3 = self.adjust_theta_3()
+            theta_initial = theta_opt.clone().detach()
+            self.theta_initial = theta_initial
+
+            lr = 0.001
+            loss = initial_loss
+            losses = []
+            max_N = 10000
+            N_iter_filter = 1000
+            loss_crit = 1.5
+            loss_filter = 3.5
+            N_iter = 0
+            optimizer = Adam([theta_opt], lr)
+
+            while N_iter < max_N:
+                # if N_iter == 0:
+                #     print(f"Initial Loss = {loss}")
+                optimizer.zero_grad()
+                y_pred_3 = self.curve_torch_3(self.x_tensor, *theta_opt)
+                loss = self.loglike(y_pred_3, self.y_tensor, self.y_err_tensor)
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.detach().numpy())
+                N_iter += 1
+                # if loss < loss_crit:
+                #     success = True
+                #     break
+                # if N_iter % 250 == 0:
+                    # print(f"N_iter = {N_iter}")
+                    # print(f"Loss = {loss}")
+                if N_iter == N_iter_filter and loss > loss_filter:
+                    # print("Loss too high. Starting again.")
+                    print(f"Final loss before filter = {losses[-1]}")
+                    break
+                # if N_iter == N_iter_filter and loss < loss_filter:
+                    # print(f"Loss at {N_iter_filter} iterations = {loss}")
+
+            if N_iter == max_N:
+                success = True
+
+        if success == True:
+
+            self.losses = np.array(losses)
+
+            theta_final = []
+
+            for i in range(len(theta_opt)):
+                theta_final.append(theta_opt[i])
+
+            self.theta_final = torch.tensor(theta_final, dtype=torch.float32)
+            self.max_N = max_N
+            self.loss_filter = loss_filter
+            self.N_iter_filter = N_iter_filter
+            self.learning_rate = lr
+            self.losses = np.array(losses)
+        
+            print(f"Final theta = {self.theta_final}, Final loss = {losses[-1]}, Number of iterations = {N_iter}")
+            
+            # # Save results if good
+
+            # timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            # filename_theta_initial = f"Theta_3_initial_{timestamp}.txt"
+            # filename_theta_final = f"Theta_3_final_{timestamp}.txt"
+
+            # with open(filename_theta_initial, 'w') as f:
+            #     f.write(str(self.theta_final.tolist()))
+            # with open(filename_theta_final, 'w') as f:
+            #     f.write(str(self.theta_final.tolist()))
+
+            # #Save figures
+            # plt.errorbar(De_mass, De_event, yerr=yerr, fmt='.', color='black', ecolor='red')
+            # y_pred_3_plot = curve_torch_3(x_tensor, *theta_final).detach().numpy()
+            # plt.plot(De_mass, y_pred_3_plot)
+            # plt.yscale("log")
+            # plt.xscale("log")
+            # plt.xlabel("Mass [GeV]")
+            # plt.ylabel("Events/10 GeV")
+            # plt.xlim(200, 4000)
+            # plt.ylim(top=10**5)
+            # plt.xticks([200, 300, 400, 1000, 2000, 3000, 4000])
+
+            # filename_fig = f"Fig_3_{timestamp}.pdf"
+            # plt.savefig(filename_fig)
+            # plt.show()
+
+            # f_loss,a_loss = plt.subplots()
+            # a_loss.plot(losses)
+            # a_loss.set_yscale("log")
+            # a_loss.set_ylabel("Loss")
+            # a_loss.set_xlabel("Iteration")
+
+            # filename_figloss = f"Fig_3_loss_{timestamp}.pdf"
+            # f_loss.savefig(filename_figloss, bbox_inches="tight")
+
+
+
+
+            # # Plot results
+
+            # plt.errorbar(self.De_mass, self.De_event, yerr=self.yerr, fmt='.', color='black', ecolor='red')
+            # y_pred_3_plot = self.curve_torch_3(self.x_tensor, *theta_final).detach().numpy()
+            # plt.plot(self.De_mass, y_pred_3_plot)
+            # plt.yscale("log")
+            # plt.xscale("log")
+            # plt.xlabel("Mass [GeV]")
+            # plt.ylabel("Events/10 GeV")
+            # plt.xlim(200, 5000)
+            # plt.ylim(bottom = 10**-2, top=10**5)
+            # plt.xticks([200, 300, 400, 1000, 2000, 3000, 4000, 5000])
+            # plt.title("True data")
+            # plt.show()
+
+            # f_loss,a_loss = plt.subplots()
+            # a_loss.plot(losses)
+            # # a_loss.set_yscale("log")
+            # a_loss.set_ylabel("Loss")
+            # a_loss.set_xlabel("Iteration")
+            # # a_loss.set_xlim(N_iter-1000, N_iter)
+            # # a_loss.set_ylim(0.55, 0.6)
+
+# Define binary classifier
+            
+class BinaryClassifierBase(nn.Module):
+    """Base model for binary classification. Following 2305.11241.
+
+    A simple binary classifier:
+        - 5 hidden layers:
+            - Layer 1 with initial_dim units
+            - Layers 2-4 with internal_dim units
+        - Leaky ReLU activation function
+        - Batch normalization
+        - Output layer with 1 unit linear classifier unit
+        - Adam optimizer with default learning rate 0.001
+        - Exponential learning rate decay with default decay rate 0.95
+
+    Parameters
+    ----------
+    input_dim : int
+        Dimension of the input data.
+    internal_dim : int, optional (default=16)
+        Dimension of the internal layers of the network.
+    initial_dim : int, optional (default=130)
+        Dimension of the first layer of the network.
+    """
+
+    def __init__(self, input_dim, internal_dim=16, initial_dim=130):
+        super(BinaryClassifierBase, self).__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, initial_dim),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(initial_dim),
+            nn.Linear(initial_dim, internal_dim),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(internal_dim),
+            nn.Linear(internal_dim, internal_dim),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(internal_dim),
+            nn.Linear(internal_dim, internal_dim),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(internal_dim),
+            nn.Linear(internal_dim, internal_dim),
+            nn.LeakyReLU(),
+            nn.Linear(internal_dim, 1),
+        )
+
+    def forward(self, x):
+        """Forward pass through the network, logit output."""
+        return self.model(x)
+
+    def loss(self, x, y):
+        """Loss function for the network."""
+        raise NotImplementedError
+
+    def predict(self, x):
+        """Predict the Bayes Factor."""
+        raise NotImplementedError
+
+    def fit(self, X, y, **kwargs):
+        """Fit classifier on input features X to predict labels y.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Input data.
+        y : array-like, shape (n_samples,)
+            Target values.
+        num_epochs : int, optional (default=10)
+            Number of epochs to train the network.
+        batch_size : int, optional (default=128)
+            Batch size for training.
+        decay_rate : float, optional (default=0.95)
+            Decay rate for the learning rate scheduler.
+        lr : float, optional (default=0.001)
+            Learning rate for the optimizer.
+        device : str, optional (default="cpu")
+            Device to use for training.
+        """
+        num_epochs = kwargs.get("num_epochs", 10)
+        batch_size = kwargs.get("batch_size", 128)
+        decay_rate = kwargs.get("decay_rate", 0.95)
+        lr = kwargs.get("lr", 0.001)
+        device = torch.device(kwargs.get("device", "cpu"))
+
+        print("Using device: ", device)
+
+        # Convert labels to torch tensor
+        X = torch.tensor(X, dtype=torch.float32)
+        labels = torch.tensor(y, dtype=torch.float32)
+        labels = labels.unsqueeze(1)
+        labels = labels.to(device)
+
+        # Create a DataLoader for batch training
+        dataset = torch.utils.data.TensorDataset(X, labels)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=True
+        )
+
+        # Define the loss function and optimizer
+        criterion = self.loss
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+
+        # Create the scheduler and pass in the optimizer and decay rate
+        scheduler = ExponentialLR(optimizer, gamma=decay_rate)
+
+        # Create a DataLoader for batch training
+        self.to(device=device, dtype=torch.float32)
+
+        for epoch in range(num_epochs):
+            epoch_loss = []
+            for i, (inputs, targets) in enumerate(dataloader):
+                # Clear gradients
+                optimizer.zero_grad()
+                inputs = inputs.to(device)
+                # Forward pass
+                loss = criterion(inputs, targets)
+                epoch_loss.append(loss.item())
+                # Backward pass and optimize
+                loss.backward()
+                optimizer.step()
+
+            # Print loss for every epoch
+            scheduler.step()
+            mean_loss = torch.mean(torch.tensor(epoch_loss)).item()
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {mean_loss}")
+
+        # once training is done, set the model to eval(), ensures batchnorm
+        # and dropout are not used during inference
+        self.model.eval()
+
+class BinaryClassifier(BinaryClassifierBase):
+    """
+    Extends the BinaryClassifierBase to use a BCE loss function.
+
+    Furnishes with a direction prediction of the Bayes Factor.
+    """
+
+    def loss(self, x, y):
+        """Binary cross entropy loss function for the network."""
+        y_ = self.forward(x)
+        return nn.BCEWithLogitsLoss()(y_, y)
+
+    def predict(self, x):
+        """Predict the log Bayes Factor.
+
+        log K = lnP(Class 1) - lnP(Class 0)
+        """
+        # ensure model is in eval just in case
+        self.model.eval()
+
+        x = torch.tensor(x, dtype=torch.float32)
+        x = torch.atleast_2d(x)
+        pred = self.forward(x)
+        pred = nn.Sigmoid()(pred)
+        return (torch.log(pred) - torch.log(1 - pred)).detach().numpy()
+
+# Load and process data
+
+De_mass, De_event, yerr = load_and_process_data('/Users/ptsandsway/github-classroom/Part-III-Project/De_data.csv')
+
+# Save function for arrays
+
+def save_multiple_arrays_with_timestamp(*arrays, base_filename='saved_log_K_arrays_i2vi3'):
+    """
+    Saves multiple NumPy arrays to a single file with a timestamp, keeping them separate.
+    
+    Parameters:
+    - arrays: Multiple NumPy array objects passed as separate arguments.
+    - base_filename: Optional. Base name of the file without extension.
+    
+    The function saves the file in the current directory with the format:
+    `base_filename_YYYYMMDD_HHMMSS.npz`
+
+    Array1 = log_K_array
+    Array2 = log_K_array_sub_array_means
+    Array3 = log_K_array_means
+    """
+    # Format the current date and time as YYYYMMDD_HHMMSS
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # Construct the filename with base_filename and timestamp
+    filename = f'{base_filename}_{timestamp}.npz'
+    
+    # Prepare the arrays dict to save; keys are array0, array1, etc.
+    arrays_dict = {f'array{i}': array for i, array in enumerate(arrays)}
+    
+    # Save the arrays to the file using np.savez
+    np.savez(filename, **arrays_dict)
+    
+    print(f'Arrays saved as {filename}')
+
+# Generate datasets
+            
+log_K_array = []
+log_K_array_means = []
+log_K_array_sub_array_means = []
+num_sim_dataset_arrays_train_on = 10
+num_sim_datasets_per_array = 10**3
+num_val_datasets = 1
+num_train_rounds = 1000
+
+for i in range(num_sim_dataset_arrays_train_on):
+
+    # Usage
+    N = num_sim_datasets_per_array
+    data_path = '/Users/ptsandsway/github-classroom/Part-III-Project/De_data.csv'
+    optimizer_class = optim_p3_poisson(data_path)
+    x_tensor = optimizer_class.x_tensor
+    array_vector_datasets_3 = []
+    while len(array_vector_datasets_3) < N:
+        theta = optimizer_class.create_priors()
+        y_pred_3_rvs_priors = optimizer_class.curve_torch_3(x_tensor, *theta)
+        y_pred_3_rvs_priors_plus_noise = torch.poisson(y_pred_3_rvs_priors)
+        if all(y_val > 1 for y_val in y_pred_3_rvs_priors_plus_noise[:80]) and all(y_val > 10**2 for y_val in y_pred_3_rvs_priors_plus_noise[:1]) and all(y_pred_3_rvs_priors_plus_noise[0] > elem for elem in y_pred_3_rvs_priors_plus_noise[1:]):
+            array_vector_datasets_3.append(y_pred_3_rvs_priors_plus_noise.detach().numpy())
+
+    print("Datasets simulated")
+
+    # Usage
+    data_path = '/Users/ptsandsway/github-classroom/Part-III-Project/De_data.csv'
+    optimizer_class = optim_p2_poisson(data_path)
+    x_tensor = optimizer_class.x_tensor
+    array_vector_datasets_2 = []
+    while len(array_vector_datasets_2) < N:
+        theta = optimizer_class.create_priors()
+        y_pred_2_rvs_priors = optimizer_class.curve_torch_2(x_tensor, *theta)
+        y_pred_2_rvs_priors_plus_noise = torch.poisson(y_pred_2_rvs_priors)
+        if all(y_val > 1 for y_val in y_pred_2_rvs_priors_plus_noise[:80]) and all(y_val > 10**2 for y_val in y_pred_2_rvs_priors_plus_noise[:1]) and all(y_pred_2_rvs_priors_plus_noise[0] > elem for elem in y_pred_2_rvs_priors_plus_noise[1:]):
+            array_vector_datasets_2.append(y_pred_2_rvs_priors_plus_noise.detach().numpy())
+
+    print("Datasets simulated")
+
+    # Validation datasets as real data
+
+    array_vector_datasets_validation = []
+
+    array_vector_datasets_validation.append(De_event)
+
+    D3 = np.array(array_vector_datasets_3)
+    D2 = np.array(array_vector_datasets_2)
+
+    X = x_tensor
+
+    class CustomBinaryClassifier(BinaryClassifier):
+        def fit(self, X, y, **kwargs):
+            # kwargs['batch_size'] = 128
+            kwargs['num_epochs'] = 30
+            super().fit(X, y, **kwargs)
+
+    data = np.concatenate((D2, D3))
+    labels = np.concatenate((np.zeros(N), np.ones(N)))
+
+    log_K_sub_array = []
+    log_K_sub_array_means = []
+
+    for j in range(num_val_datasets):
+
+        array_vector_datasets_validation_subset = array_vector_datasets_validation[j]
+        log_K_sub2_array = []
+        valid_log_K_found = False
+
+        # Outer loop to ensure all log_K values are finite
+        while not valid_log_K_found:
+            temp_log_K_sub2_array = []
+            all_finite = True
+            inf_counter = 0
+
+            for k in range(num_train_rounds):
+                finite_log_K_found = False  # Indicator for the current training round
+                
+                while not finite_log_K_found: # Calling a new instance of evidence_network each time to start training from fresh
+                    evidence_network = CustomBinaryClassifier(len(X))
+                    evidence_network.fit(data, labels)
+                    log_K = evidence_network.predict(array_vector_datasets_validation_subset[...,None].T).squeeze()
+
+                    if np.isnan(log_K):
+                        print("Nan produced, retraining network.")
+                    elif -10 <= log_K <= 10:
+                        print(f"Bayes Factor = {log_K}")
+                        temp_log_K_sub2_array.append(log_K)
+                        finite_log_K_found = True
+                    elif log_K < -10:
+                        print(f"Bayes Factor = {log_K}")
+                        print("Out of bounds Bayes Factor detected, appending -10 instead.")
+                        max_value = -10
+                        temp_log_K_sub2_array.append(max_value)
+                        finite_log_K_found = True
+                        inf_counter += 1
+                    elif log_K > 10:
+                        print(f"Bayes Factor = {log_K}")
+                        print("Out of bounds Bayes Factor detected, appending 10 instead.")
+                        max_value = 10
+                        temp_log_K_sub2_array.append(max_value)
+                        finite_log_K_found = True
+                        inf_counter += 1
+                    if inf_counter >= 20:
+                        print("Sufficient inf produced to use new training set.")
+                        break
+                if inf_counter >= 20:
+                    print("Sufficient inf produced to use new training set.")
+                    break
+            # # Check if the entire set of log_K values are finite
+            # if all(not np.isinf(log_K).any() for log_K in temp_log_K_sub2_array):
+            log_K_sub2_array = temp_log_K_sub2_array  # Save the valid results
+            valid_log_K_found = True  # Exit the outer while loop
+            if inf_counter >= 20:
+                print("Sufficient inf produced to use new training set.")
+                break
+        if inf_counter >= 20:
+            print("Sufficient inf produced to use new training set.")
+            break
+        
+        log_K_sub_array.append(log_K_sub2_array)
+        log_K_sub_array_means.append(np.mean(log_K_sub2_array))
+
+    log_K_array.append(log_K_sub_array)
+    log_K_array_sub_array_means.append(log_K_sub_array_means)
+    log_K_array_means.append(np.mean(log_K_sub_array_means))
+
+# Rename for clarity
+
+logk_trainsets_valsets_trainrounds = log_K_array
+logk_given_trainset_across_valsets_trainrounds_means = log_K_array_sub_array_means
+logk_across_trainset_valsets_means_trainrounds_means = log_K_array_means
+
+# Save arrays
+
+save_multiple_arrays_with_timestamp(logk_trainsets_valsets_trainrounds, logk_given_trainset_across_valsets_trainrounds_means, logk_across_trainset_valsets_means_trainrounds_means, base_filename='log_K_arrays_i2vi3')
+
+for i in range(num_sim_dataset_arrays_train_on):
+
+    for j in range(num_val_datasets):
+
+        plt.hist(log_K_array[i][j], bins=50, edgecolor='black')
+        plt.title(f'Histogram of log_k, training set {i}, validation set {j}, vary train rds')
+        plt.xlabel('log_k')
+        plt.ylabel('Frequency')
+        plt.show()
+            
+        data_path = '/Users/ptsandsway/github-classroom/Part-III-Project/De_data.csv'
+        optimizer_class = optim_p3_poisson(data_path)
+        curve_torch_3 = optimizer_class.curve_torch_3
+        plt.scatter(optimizer_class.De_mass, array_vector_datasets_validation[j], color='black')
+        plt.yscale("log")
+        plt.xscale("log")
+        plt.xlabel("Mass [GeV]")
+        plt.ylabel("Events/10 GeV")
+        plt.xlim(200, 5000)
+        plt.ylim(bottom = 10**-2, top=10**5)
+        plt.xticks([200, 300, 400, 1000, 2000, 3000, 4000, 5000])
+        plt.title(f"Validation data {j}")
+        plt.show()
+    
+    plt.hist(log_K_array_sub_array_means[i], bins=50, edgecolor='black')
+    plt.title(f'Histogram of log_k, train set{i}, varying val set, avg train rds')
+    plt.xlabel('log_k')
+    plt.ylabel('Frequency')
+    plt.show()
+
+plt.hist(log_K_array_means, bins=50, edgecolor='black')
+plt.title(f'Histogram of log_k, varying train set, avg val set, avg training rds')
+plt.xlabel('log_k')
+plt.ylabel('Frequency')
+plt.show()
